@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
 import {
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine, ResponsiveContainer,
 } from "recharts";
-import { Plus, Trash2, TrendingUp, TrendingDown, Gauge, PlaneTakeoff, HeartPulse, ChevronDown, ChevronUp, Users, Info } from "lucide-react";
+import { Plus, Trash2, TrendingUp, TrendingDown, Gauge, PlaneTakeoff, HeartPulse, ChevronDown, ChevronUp, Info } from "lucide-react";
 
 const STORAGE_KEY = "retirement-runway-inputs-v2";
 
@@ -1149,13 +1149,13 @@ export default function RetirementRunway() {
     if (p.you.semiRetirementEnabled && p.you.retirementAge !== p.you.semiRetirementEndAge) {
       setP((prev) => ({ ...prev, you: { ...prev.you, retirementAge: prev.you.semiRetirementEndAge } }));
     }
-  }, [p.you.semiRetirementEnabled, p.you.semiRetirementEndAge]);
+  }, [p.you.semiRetirementEnabled, p.you.semiRetirementEndAge, p.you.retirementAge]);
 
   useEffect(() => {
     if (p.partner.semiRetirementEnabled && p.partner.retirementAge !== p.partner.semiRetirementEndAge) {
       setP((prev) => ({ ...prev, partner: { ...prev.partner, retirementAge: prev.partner.semiRetirementEndAge } }));
     }
-  }, [p.partner.semiRetirementEnabled, p.partner.semiRetirementEndAge]);
+  }, [p.partner.semiRetirementEnabled, p.partner.semiRetirementEndAge, p.partner.retirementAge]);
 
   const sim = useMemo(() => runSimulation(p), [p]);
   const mc = useMemo(() => (p.monteCarloEnabled ? runMonteCarlo(p, 500) : null), [p]);
@@ -1202,7 +1202,6 @@ export default function RetirementRunway() {
   const youName = p.you.name.trim();
   const partnerName = p.partner.name.trim();
   const youNamed = youName.length > 0;
-  const partnerNamed = partnerName.length > 0;
   const youLabel = youName || "You";
   const partnerLabel = partnerName || "Partner";
   const youPossessive = youName ? `${youName}'s` : "Your";
