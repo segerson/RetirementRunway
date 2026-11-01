@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
 import {
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine, ResponsiveContainer,
 } from "recharts";
+import { supabase } from "./supabaseClient";
 import { Plus, Trash2, TrendingUp, TrendingDown, Gauge, PlaneTakeoff, HeartPulse, ChevronDown, ChevronUp, Info } from "lucide-react";
 
 const STORAGE_KEY = "retirement-runway-inputs-v2";
@@ -23,6 +24,14 @@ const DEFAULT_YOU = {
   desiredSpending: 70000,
   socialSecurityAnnual: 24000,
   socialSecurityStartAge: 67,
+  expenses: [
+    { id: "e1", label: "Kid's college", age: 55, amount: 80000 },
+    { id: "e2", label: "New roof / home repair", age: 48, amount: 25000 },
+  ],
+  income: [
+    { id: "i1", label: "Pension", type: "recurring", amount: 12000, startAge: 65, endAge: 90, untilDeath: true },
+    { id: "i2", label: "Expected inheritance", type: "oneTime", amount: 50000, age: 60 },
+  ],
 };
 
 const DEFAULT_PARTNER = {
@@ -42,6 +51,8 @@ const DEFAULT_PARTNER = {
   desiredSpending: 70000,
   socialSecurityAnnual: 18000,
   socialSecurityStartAge: 67,
+  expenses: [],
+  income: [],
 };
 
 const DEFAULT_JOINT = {
@@ -58,12 +69,15 @@ const DEFAULTS = {
   volatilityMultiplier: 100,
   inflation: 3,
   partnerEnabled: false,
+  timeHorizon: "lifeExpectancy", // "lifeExpectancy" | "fixed30"
   jointFlags: {
     currentSavings: true,
     contribution: false,
     preReturn: true,
     postReturn: true,
     desiredSpending: true,
+    expenses: true,
+    income: true,
   },
   you: DEFAULT_YOU,
   partner: DEFAULT_PARTNER,
@@ -72,7 +86,40 @@ const DEFAULTS = {
     { id: "e1", label: "Kid's college", age: 55, amount: 80000 },
     { id: "e2", label: "New roof / home repair", age: 48, amount: 25000 },
   ],
+  income: [
+    { id: "i1", label: "Pension", type: "recurring", amount: 12000, startAge: 65, endAge: 90, untilDeath: true },
+    { id: "i2", label: "Expected inheritance", type: "oneTime", amount: 50000, age: 60 },
+  ],
 };
+
+// Powers every numeric input in the app. Deliberately NOT type="number" — browsers (and
+// React's reconciliation with them) sometimes skip re-rendering a number input's displayed
+// text when the new value is numerically equivalent to what's already shown (e.g. "4" vs
+// "04" both parse to 4), which is exactly what causes a stray leading zero to stick around
+// after a field is cleared and retyped. Using a plain text input with local string state
+// sidesteps that entirely — the display is fully our own string, always exactly what we set.
+function useNumericInput(value, onChange) {
+  const [text, setText] = useState(String(value));
+  useEffect(() => { setText(String(value)); }, [value]);
+
+  const handleChange = (e) => {
+    const raw = e.target.value;
+    if (!/^-?\d*\.?\d*$/.test(raw)) return; // ignore stray non-numeric characters
+    const negative = raw.startsWith("-");
+    let body = negative ? raw.slice(1) : raw;
+    body = body.replace(/^0+(?=\d)/, ""); // strip leading zeros: "04" -> "4", but keep "0", "0.25"
+    const cleaned = (negative ? "-" : "") + body;
+    setText(cleaned);
+    if (cleaned === "" || cleaned === "-" || cleaned === "." || cleaned === "-.") {
+      onChange(0);
+    } else {
+      const n = Number(cleaned);
+      if (!Number.isNaN(n)) onChange(n);
+    }
+  };
+
+  return { text, handleChange };
+}
 
 function fmtUSD(n, digits = 0) {
   const v = Number.isFinite(n) ? n : 0;
@@ -98,11 +145,28 @@ function mulberry32(seed) {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
+// Long-run illustrative US historical inflation stats (CPI), used to drive inflation as a
+// random variable in the Monte Carlo simulation instead of a single fixed rate.
+const HIST_INFLATION_MEAN = 3.0; // %/yr
+const HIST_INFLATION_STDEV = 3.5; // %/yr
+// Unexpectedly high inflation has historically coincided with somewhat weaker real market
+// performance (e.g. the stagflation of the late 1970s), so the two are drawn as correlated
+// random variables rather than fully independent ones — a modest negative correlation, not
+// a tight linkage, hence "slight."
+const INFLATION_RETURN_CORRELATION = -0.25;
+
 function randNormal(rng) {
   let u = 0, v = 0;
   while (u === 0) u = rng();
   while (v === 0) v = rng();
   return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+// Two standard-normal draws with correlation rho, via the standard z2' = rho*z1 + sqrt(1-rho^2)*z2
+// construction — used to link each year's random inflation shock to that year's random return shock.
+function randCorrelatedPair(rng, rho) {
+  const z1 = randNormal(rng);
+  const z2 = randNormal(rng);
+  return { a: z1, b: rho * z1 + Math.sqrt(1 - rho * rho) * z2 };
 }
 
 // Long-run historical relationship between a portfolio's average nominal return and its
@@ -170,13 +234,22 @@ function simulateHousehold(p, rng) {
   // off otherwise, so single-person mode always reads from you.* (what the UI edits)
   // instead of the unused, un-editable joint.* defaults.
   const jf = p.partnerEnabled ? p.jointFlags : {
-    currentSavings: false, contribution: false, preReturn: false, postReturn: false, desiredSpending: false,
+    currentSavings: false, contribution: false, preReturn: false, postReturn: false, desiredSpending: false, expenses: false, income: false,
   };
 
-  const numYears = 1 + Math.max(
+  // Time horizon: either project through whichever of you is likely to live longer (the
+  // default), or use a fixed 30-year window from today regardless of life expectancy — a
+  // common conservative planning convention for not under-forecasting longevity risk.
+  const numYears = p.timeHorizon === "fixed30" ? 30 : 1 + Math.max(
     you.lifeExpectancy - you.currentAge,
     partner ? partner.lifeExpectancy - partner.currentAge : -Infinity
   );
+
+  // When Monte Carlo is on, inflation is no longer the user's fixed input — the deterministic
+  // line uses the long-run historical average instead, and randomized trials draw a different
+  // realized rate each year (see below) rather than compounding one fixed rate throughout.
+  const inflationMeanPct = p.monteCarloEnabled ? HIST_INFLATION_MEAN : p.inflation;
+  let cumInflation = 1;
 
   let balance = jf.currentSavings
     ? p.joint.currentSavings
@@ -208,9 +281,18 @@ function simulateHousehold(p, rng) {
     const meanReturnPct = rateList.reduce((a, b) => a + b, 0) / rateList.length;
 
     let r = meanReturnPct / 100;
+    let inflationFactor;
     if (rng) {
+      // Correlated random draws: 'a' drives inflation, 'b' drives the market return, linked
+      // by INFLATION_RETURN_CORRELATION rather than sampled independently.
+      const { a: inflationShock, b: returnShock } = randCorrelatedPair(rng, INFLATION_RETURN_CORRELATION);
       const vol = (estimateVolatility(meanReturnPct) * p.volatilityMultiplier) / 100 / 100;
-      r = meanReturnPct / 100 + vol * randNormal(rng);
+      r = meanReturnPct / 100 + vol * returnShock;
+      const yearlyInflation = Math.max(-0.15, HIST_INFLATION_MEAN / 100 + (HIST_INFLATION_STDEV / 100) * inflationShock);
+      cumInflation *= 1 + yearlyInflation;
+      inflationFactor = cumInflation;
+    } else {
+      inflationFactor = Math.pow(1 + inflationMeanPct / 100, i);
     }
     balance = balance * (1 + r);
 
@@ -249,7 +331,6 @@ function simulateHousehold(p, rng) {
     balance += added;
 
     // --- Social Security / pension (always individual) ---
-    const inflationFactor = Math.pow(1 + p.inflation / 100, i);
     const ssYou = youAge >= you.socialSecurityStartAge ? you.socialSecurityAnnual * inflationFactor : 0;
     const ssPartner = partner && partnerAge >= partner.socialSecurityStartAge ? partner.socialSecurityAnnual * inflationFactor : 0;
 
@@ -275,10 +356,30 @@ function simulateHousehold(p, rng) {
     }
     balance -= withdrawal;
 
-    // --- One-off major expenses (shared list, keyed to your age) ---
-    const expensesThisYear = p.expenses
-      .filter((e) => e.age === youAge)
+    // --- Fixed income — entered in today's dollars, inflated the same way spending and
+    // Social Security are, to the year it's received. Joint uses one shared list keyed to
+    // your age; individual uses each person's own list keyed to their own age.
+    const incomeFor = (list, age) => list.reduce((sum, inc) => {
+      const amt = Number(inc.amount) || 0;
+      if (inc.type === "oneTime") {
+        return inc.age === age ? sum + amt * inflationFactor : sum;
+      }
+      const started = age >= inc.startAge;
+      const ended = !inc.untilDeath && age > inc.endAge;
+      return started && !ended ? sum + amt * inflationFactor : sum;
+    }, 0);
+    const incomeThisYear = jf.income
+      ? incomeFor(p.income, youAge)
+      : incomeFor(you.income, youAge) + (partner ? incomeFor(partner.income, partnerAge) : 0);
+    balance += incomeThisYear;
+
+    // --- One-off major expenses — same joint-vs-individual, own-age-keyed pattern as income ---
+    const expensesFor = (list, age) => list
+      .filter((e) => e.age === age)
       .reduce((sum, e) => sum + (Number(e.amount) || 0), 0);
+    const expensesThisYear = jf.expenses
+      ? expensesFor(p.expenses, youAge)
+      : expensesFor(you.expenses, youAge) + (partner ? expensesFor(partner.expenses, partnerAge) : 0);
     balance -= expensesThisYear;
 
     if (balance < 0 && depletionAge === null) depletionAge = youAge;
@@ -343,6 +444,8 @@ function runMonteCarlo(p, trials = 500) {
       age: trialRows[0][i].age,
       low: Math.round(percentile(vals, 0.05)),
       high: Math.round(percentile(vals, 0.95)),
+      midLow: Math.round(percentile(vals, 0.2)),
+      midHigh: Math.round(percentile(vals, 0.8)),
       median: Math.round(percentile(vals, 0.5)),
     });
   }
@@ -368,8 +471,14 @@ const INFO_MONTE_CARLO = {
 const INFO_FUNDING_RATIO = {
   text: "The share of your retirement years the deterministic forecast covers before savings run out — e.g. 80% means the money is projected to last 80% of the way through retirement, not 80% of your full life.",
 };
+const INFO_TIME_HORIZON = {
+  text: "Choose how far out the model projects: through whichever of you is likely to live longer (based on the life expectancy fields), or a fixed 30 years from today regardless of life expectancy — a conservative convention some planners use so the plan doesn't rely on a specific longevity guess.",
+};
 const INFO_INFLATION = {
   text: "U.S. inflation has historically averaged roughly 3% per year over the long run, though it's been as low as near 0% and as high as 8%+ in individual years.",
+};
+const INFO_INFLATION_MC = {
+  text: `With Monte Carlo simulation on, inflation isn't a fixed input — it's drawn randomly each year (historical avg ${HIST_INFLATION_MEAN}%, σ ${HIST_INFLATION_STDEV}%) alongside that year's investment return, with a slight negative correlation between the two, since unexpectedly high inflation has historically coincided with somewhat weaker real market performance. The deterministic line still uses the ${HIST_INFLATION_MEAN}% historical average as a fixed rate. Turn Monte Carlo off to set your own fixed inflation assumption.`,
 };
 const INFO_SEMI_CONTRIB = {
   text: "During semi-retirement, it's common for retirement contributions to fall — and potentially even turn slightly negative — as part-time income covers less of your expenses than full-time work did.",
@@ -460,17 +569,22 @@ function TextField({ label, value, onChange, placeholder, info }) {
   );
 }
 
-function NumberField({ label, value, onChange, suffix, min, max, step = 1, hint, info, compact }) {
+function NumberField({ label, value, onChange, suffix, min, max, step = 1, hint, info, compact, disabled, disabledNote }) {
+  const { text, handleChange } = useNumericInput(value, onChange);
   return (
-    <label style={{ display: "block", marginBottom: compact ? 0 : 14 }}>
+    <label style={{ display: "block", marginBottom: compact ? 0 : 14, opacity: disabled ? 0.5 : 1 }}>
       {label && (
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4 }}>
           <span style={{ fontFamily: "Inter, sans-serif", fontSize: 12.5, color: "#8A93A6", letterSpacing: "0.01em", display: "flex", alignItems: "center" }}>
             {label}
             {info && <InfoTip {...info} />}
           </span>
-          {hint && (
-            <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, color: "#B98B3E" }}>{hint}</span>
+          {disabled && disabledNote ? (
+            <span style={{ fontFamily: "Inter, sans-serif", fontSize: 10.5, color: "#8A93A6", fontStyle: "italic" }}>{disabledNote}</span>
+          ) : (
+            hint && (
+              <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, color: "#B98B3E" }}>{hint}</span>
+            )
           )}
         </div>
       )}
@@ -484,14 +598,17 @@ function NumberField({ label, value, onChange, suffix, min, max, step = 1, hint,
             value={value}
             onChange={(e) => onChange(Number(e.target.value))}
             className="runway-slider"
-            style={{ flex: 1 }}
+            disabled={disabled}
+            style={{ flex: 1, cursor: disabled ? "not-allowed" : "pointer" }}
           />
         )}
         <div style={{ display: "flex", alignItems: "center", gap: 2, flex: compact ? 1 : "initial" }}>
           <input
-            type="number"
-            value={value}
-            onChange={(e) => onChange(Number(e.target.value))}
+            type="text"
+            inputMode="decimal"
+            value={text}
+            onChange={handleChange}
+            disabled={disabled}
             style={{
               width: compact ? "100%" : 74,
               background: "#0E1426",
@@ -502,6 +619,7 @@ function NumberField({ label, value, onChange, suffix, min, max, step = 1, hint,
               fontSize: 13,
               padding: "5px 6px",
               textAlign: "right",
+              cursor: disabled ? "not-allowed" : "text",
             }}
           />
           {suffix && <span style={{ color: "#8A93A6", fontSize: 12, fontFamily: "Inter, sans-serif" }}>{suffix}</span>}
@@ -539,23 +657,26 @@ function MiniTextInput({ label, value, onChange, placeholder }) {
   );
 }
 
-function MiniNumberInput({ label, value, onChange, suffix, min, max, step = 1, info }) {
+function MiniNumberInput({ label, value, onChange, suffix, min, max, step = 1, info, disabled, disabledNote }) {
+  const { text, handleChange } = useNumericInput(value, onChange);
   return (
-    <label style={{ display: "block", marginBottom: 8 }}>
+    <label style={{ display: "block", marginBottom: 8, opacity: disabled ? 0.5 : 1 }}>
       {label && (
         <div style={{ display: "flex", alignItems: "center", fontFamily: "Inter, sans-serif", fontSize: 10.5, color: "#8A93A6", marginBottom: 2 }}>
           {label}
           {info && <InfoTip {...info} />}
+          {disabled && disabledNote && (
+            <span style={{ fontStyle: "italic", marginLeft: 5 }}>({disabledNote})</span>
+          )}
         </div>
       )}
       <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
         <input
-          type="number"
-          value={value}
-          min={min}
-          max={max}
-          step={step}
-          onChange={(e) => onChange(Number(e.target.value))}
+          type="text"
+          inputMode="decimal"
+          value={text}
+          onChange={handleChange}
+          disabled={disabled}
           style={{
             width: "100%",
             background: "#0E1426",
@@ -565,6 +686,7 @@ function MiniNumberInput({ label, value, onChange, suffix, min, max, step = 1, i
             fontFamily: "'IBM Plex Mono', monospace",
             fontSize: 12,
             padding: "6px 7px",
+            cursor: disabled ? "not-allowed" : "text",
           }}
         />
         {suffix && <span style={{ color: "#8A93A6", fontSize: 10.5, fontFamily: "Inter, sans-serif" }}>{suffix}</span>}
@@ -735,6 +857,148 @@ function PersonTag({ children, color }) {
 
 const YOU_COLOR = "#D9B872";
 const PARTNER_COLOR = "#8FA6D9";
+
+function ExpenseRow({ item, onUpdate, onRemove, ageTitle }) {
+  const age = useNumericInput(item.age, (v) => onUpdate(item.id, "age", v));
+  const amount = useNumericInput(item.amount, (v) => onUpdate(item.id, "amount", v));
+  return (
+    <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 8 }}>
+      <input
+        className="runway-input"
+        value={item.label}
+        onChange={(ev) => onUpdate(item.id, "label", ev.target.value)}
+        style={{ flex: 1, minWidth: 0, boxSizing: "border-box", background: "#0E1426", border: "1px solid #2A3355", borderRadius: 6, color: "#F0EAD8", fontFamily: "Inter, sans-serif", fontSize: 12, padding: "6px 8px" }}
+      />
+      <input
+        className="runway-input"
+        type="text"
+        inputMode="decimal"
+        value={age.text}
+        onChange={age.handleChange}
+        title={ageTitle}
+        style={{ width: 48, flexShrink: 0, boxSizing: "border-box", background: "#0E1426", border: "1px solid #2A3355", borderRadius: 6, color: "#D9B872", fontFamily: "'IBM Plex Mono', monospace", fontSize: 12, padding: "6px 4px", textAlign: "center" }}
+      />
+      <input
+        className="runway-input"
+        type="text"
+        inputMode="decimal"
+        value={amount.text}
+        onChange={amount.handleChange}
+        title="Amount"
+        style={{ width: 78, flexShrink: 0, boxSizing: "border-box", background: "#0E1426", border: "1px solid #2A3355", borderRadius: 6, color: "#F0EAD8", fontFamily: "'IBM Plex Mono', monospace", fontSize: 12, padding: "6px 6px", textAlign: "right" }}
+      />
+      <button
+        onClick={() => onRemove(item.id)}
+        aria-label="Remove expense"
+        style={{ width: 23, flexShrink: 0, boxSizing: "border-box", background: "transparent", border: "none", color: "#C2542D", cursor: "pointer", padding: 4, display: "flex", alignItems: "center", justifyContent: "center" }}
+      >
+        <Trash2 size={15} />
+      </button>
+    </div>
+  );
+}
+
+function ExpenseList({ items, onAdd, onUpdate, onRemove, ageTitle, ageLabel = "Age" }) {
+  return (
+    <>
+      <div style={{ display: "flex", gap: 6, marginBottom: 4 }}>
+        <div style={{ flex: 1, minWidth: 0, fontFamily: "Inter, sans-serif", fontSize: 9.5, color: "#5E6885", textTransform: "uppercase", letterSpacing: "0.03em" }}>Label</div>
+        <div style={{ width: 48, flexShrink: 0, textAlign: "center", fontFamily: "Inter, sans-serif", fontSize: 9.5, color: "#5E6885", textTransform: "uppercase", letterSpacing: "0.03em", lineHeight: 1.3 }}>{ageLabel}</div>
+        <div style={{ width: 78, flexShrink: 0, textAlign: "right", fontFamily: "Inter, sans-serif", fontSize: 9.5, color: "#5E6885", textTransform: "uppercase", letterSpacing: "0.03em" }}>Amount</div>
+        <div style={{ width: 23, flexShrink: 0 }} />
+      </div>
+      {items.map((e) => (
+        <ExpenseRow key={e.id} item={e} onUpdate={onUpdate} onRemove={onRemove} ageTitle={ageTitle} />
+      ))}
+      <button
+        onClick={onAdd}
+        style={{
+          display: "flex", alignItems: "center", gap: 6, background: "transparent",
+          border: "1px dashed #2A3355", borderRadius: 6, color: "#8A93A6",
+          fontFamily: "Inter, sans-serif", fontSize: 12.5, padding: "7px 10px", cursor: "pointer", marginTop: 4, marginBottom: 10,
+        }}
+      >
+        <Plus size={14} /> Add expense
+      </button>
+    </>
+  );
+}
+
+function IncomeList({ items, onAdd, onUpdate, onRemove, ageOwnerLabel }) {
+  const ageSuffix = ageOwnerLabel ? ` (${ageOwnerLabel})` : "";
+  return (
+    <>
+      {items.map((inc) => (
+        <div key={inc.id} style={{ border: "1px solid #2A3355", borderRadius: 8, padding: "10px 10px 8px", marginBottom: 10, background: "#0E1426" }}>
+          <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 8 }}>
+            <input
+              className="runway-input"
+              value={inc.label}
+              onChange={(ev) => onUpdate(inc.id, "label", ev.target.value)}
+              style={{ flex: 1, minWidth: 0, boxSizing: "border-box", background: "#12182B", border: "1px solid #2A3355", borderRadius: 6, color: "#F0EAD8", fontFamily: "Inter, sans-serif", fontSize: 12, padding: "6px 8px" }}
+            />
+            <button
+              onClick={() => onRemove(inc.id)}
+              aria-label="Remove income"
+              style={{ background: "transparent", border: "none", color: "#C2542D", cursor: "pointer", padding: 4, flexShrink: 0 }}
+            >
+              <Trash2 size={15} />
+            </button>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 8 }}>
+            <label style={{ display: "block" }}>
+              <div style={{ fontFamily: "Inter, sans-serif", fontSize: 10.5, color: "#8A93A6", marginBottom: 2 }}>Type</div>
+              <select
+                value={inc.type}
+                onChange={(ev) => onUpdate(inc.id, "type", ev.target.value)}
+                style={{ width: "100%", background: "#12182B", border: "1px solid #2A3355", borderRadius: 6, color: "#F0EAD8", fontFamily: "Inter, sans-serif", fontSize: 12, padding: "6px 6px" }}
+              >
+                <option value="oneTime">One-time</option>
+                <option value="recurring">Recurring</option>
+              </select>
+            </label>
+            <MiniNumberInput
+              label={inc.type === "oneTime" ? "Amount (today's $)" : "Annual amount (today's $)"}
+              value={inc.amount}
+              onChange={(v) => onUpdate(inc.id, "amount", v)}
+              min={0}
+              step={500}
+            />
+          </div>
+          {inc.type === "oneTime" ? (
+            <MiniNumberInput label={`Age${ageSuffix}`} value={inc.age} onChange={(v) => onUpdate(inc.id, "age", v)} />
+          ) : (
+            <>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                <MiniNumberInput label={`Start age${ageSuffix}`} value={inc.startAge} onChange={(v) => onUpdate(inc.id, "startAge", v)} />
+                <MiniNumberInput
+                  label={`End age${ageSuffix}`}
+                  value={inc.endAge}
+                  onChange={(v) => onUpdate(inc.id, "endAge", v)}
+                  disabled={inc.untilDeath}
+                  disabledNote="until death"
+                />
+              </div>
+              <div style={{ marginTop: 6 }}>
+                <MiniToggle checked={inc.untilDeath} onChange={(v) => onUpdate(inc.id, "untilDeath", v)} label="Continue until death" />
+              </div>
+            </>
+          )}
+        </div>
+      ))}
+      <button
+        onClick={onAdd}
+        style={{
+          display: "flex", alignItems: "center", gap: 6, background: "transparent",
+          border: "1px dashed #2A3355", borderRadius: 6, color: "#8A93A6",
+          fontFamily: "Inter, sans-serif", fontSize: 12.5, padding: "7px 10px", cursor: "pointer", marginTop: 4, marginBottom: 10,
+        }}
+      >
+        <Plus size={14} /> Add income
+      </button>
+    </>
+  );
+}
 
 function JointToggleRow({ label, joint, onToggle, info }) {
   return (
@@ -945,6 +1209,36 @@ function SectionLabel({ children }) {
   );
 }
 
+function CollapsibleSectionLabel({ children, open, onToggle }) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-expanded={open}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        width: "100%",
+        background: "transparent",
+        border: "none",
+        cursor: "pointer",
+        padding: 0,
+        fontFamily: "'Fraunces', serif",
+        fontSize: 15,
+        color: "#D9B872",
+        marginBottom: open ? 12 : 8,
+        marginTop: 22,
+        paddingBottom: 6,
+        borderBottom: "1px solid #2A3355",
+      }}
+    >
+      <span>{children}</span>
+      {open ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+    </button>
+  );
+}
+
 function StatCard({ icon, label, value, sub, tone, info }) {
   const toneColor = tone === "good" ? "#6B8F71" : tone === "bad" ? "#C2542D" : "#D9B872";
   return (
@@ -975,10 +1269,19 @@ function StatCard({ icon, label, value, sub, tone, info }) {
   );
 }
 
-function RunwayGauge({ currentAge, retirementAge, lifeExpectancy, depletionAge, semiRetirementEnabled, semiRetirementStartAge, semiRetirementEndAge, personLabel, accentColor }) {
+function RunwayGauge({ currentAge, retirementAge, lifeExpectancy, depletionAge, semiRetirementEnabled, semiRetirementStartAge, semiRetirementEndAge, personLabel, accentColor, sharedSpan }) {
   const start = currentAge;
-  const end = Math.max(lifeExpectancy, depletionAge || 0) + 1;
-  const span = end - start;
+  let end = Math.max(lifeExpectancy, depletionAge || 0) + 1;
+  // When a shared span is given (partner mode), both bars use the SAME total width in years-
+  // from-now, so a given number of years from today lands at the same horizontal position on
+  // both bars — letting events like one partner's retirement line up vertically between the
+  // two graphs — even though each bar still shows that person's own ages. Without it (no
+  // partner), the bar just spans this person's own timeline as before. It also caps how far
+  // segments are drawn: with a fixed time horizon (e.g. 30 years) shorter than someone's own
+  // life expectancy, there's no simulated data past that horizon to color in.
+  const span = sharedSpan != null ? sharedSpan : end - start;
+  if (sharedSpan != null) end = Math.min(end, start + sharedSpan + 1);
+  const displayEnd = start + span;
   const pct = (age) => ((age - start) / span) * 100;
 
   // Build solid, non-overlapping segments so each phase reads as a clearly distinct
@@ -1015,7 +1318,7 @@ function RunwayGauge({ currentAge, retirementAge, lifeExpectancy, depletionAge, 
           {personLabel ? `${personLabel} \u2013 Age ${start}` : `Age ${start}`}
         </span>
         <span style={{ fontFamily: "Inter, sans-serif", fontSize: 12, color: "#8A93A6" }}>
-          Age {end}
+          Age {displayEnd}
         </span>
       </div>
       <div style={{ position: "relative", height: 34, marginTop: 20, marginBottom: semiRetirementEnabled ? 20 : 0 }}>
@@ -1097,46 +1400,75 @@ function RunwayGauge({ currentAge, retirementAge, lifeExpectancy, depletionAge, 
   );
 }
 
-export default function RetirementRunway() {
+export default function RetirementRunway({ user, onSignOut }) {
   const [p, setP] = useState(DEFAULTS);
   const [loaded, setLoaded] = useState(false);
+  const [personalOpen, setPersonalOpen] = useState(true);
+  const [savingsOpen, setSavingsOpen] = useState(true);
   const saveTimer = useRef(null);
 
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (parsed && typeof parsed.you === "object" && typeof parsed.joint === "object") {
-          setP((prev) => ({
-            ...prev,
-            ...parsed,
-            you: { ...prev.you, ...parsed.you },
-            partner: { ...prev.partner, ...parsed.partner },
-            joint: { ...prev.joint, ...parsed.joint },
-            jointFlags: { ...prev.jointFlags, ...parsed.jointFlags },
-          }));
-        }
-      }
-    } catch (e) {
-      // no saved data yet, or an incompatible older shape — start fresh
-    } finally {
-      setLoaded(true);
+  const [saveStatus, setSaveStatus] = useState("idle");
+
+  const applySaved = useCallback((parsed) => {
+    if (parsed && typeof parsed.you === "object" && typeof parsed.joint === "object") {
+      setP((prev) => ({
+        ...prev,
+        ...parsed,
+        you: { ...prev.you, ...parsed.you },
+        partner: { ...prev.partner, ...parsed.partner },
+        joint: { ...prev.joint, ...parsed.joint },
+        jointFlags: { ...prev.jointFlags, ...parsed.jointFlags },
+      }));
     }
   }, []);
 
+  // Load this user's saved plan from the cloud (falls back to any plan saved in this browser)
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const { data, error } = await supabase
+          .from("plans")
+          .select("data")
+          .eq("user_id", user.id)
+          .maybeSingle();
+        if (cancelled) return;
+        if (error) throw error;
+        if (data && data.data) {
+          applySaved(data.data);
+        } else {
+          const raw = localStorage.getItem(STORAGE_KEY);
+          if (raw) applySaved(JSON.parse(raw));
+        }
+      } catch (e) {
+        if (!cancelled) setSaveStatus("error");
+      } finally {
+        if (!cancelled) setLoaded(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [user.id, applySaved]);
+
+  // Save to the cloud shortly after any change
   useEffect(() => {
     if (!loaded) return;
+    setSaveStatus("saving");
     if (saveTimer.current) clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(() => {
+    saveTimer.current = setTimeout(async () => {
       try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(p));
+        const { error } = await supabase
+          .from("plans")
+          .upsert({ user_id: user.id, data: p, updated_at: new Date().toISOString() });
+        if (error) throw error;
+        setSaveStatus("saved");
       } catch (e) {
-        // best effort
+        setSaveStatus("error");
       }
-    }, 500);
+    }, 800);
     return () => clearTimeout(saveTimer.current);
-  }, [p, loaded]);
+  }, [p, loaded, user.id]);
 
   const setField = useCallback((key) => (val) => setP((prev) => ({ ...prev, [key]: val })), []);
   const setYou = useCallback((key) => (val) => setP((prev) => ({ ...prev, you: { ...prev.you, [key]: val } })), []);
@@ -1165,7 +1497,13 @@ export default function RetirementRunway() {
       if (!mc) return { age: r.age, balance: r.balance };
       const high = mc.rows[i]?.high ?? r.balance;
       const low = mc.rows[i]?.low ?? r.balance;
-      return { age: r.age, balance: r.balance, high, low, band: Math.max(0, high - low) };
+      const midHigh = mc.rows[i]?.midHigh ?? r.balance;
+      const midLow = mc.rows[i]?.midLow ?? r.balance;
+      return {
+        age: r.age, balance: r.balance, high, low,
+        band: Math.max(0, high - low),
+        midLow, midHigh, midBand: Math.max(0, midHigh - midLow),
+      };
     }),
     [sim, mc]
   );
@@ -1187,6 +1525,82 @@ export default function RetirementRunway() {
   };
   const removeExpense = (id) => {
     setP((prev) => ({ ...prev, expenses: prev.expenses.filter((e) => e.id !== id) }));
+  };
+
+  const addIncome = () => {
+    setP((prev) => ({
+      ...prev,
+      income: [
+        ...prev.income,
+        { id: `i${Date.now()}`, label: "New income", type: "oneTime", amount: 10000, age: prev.you.currentAge + 5, startAge: prev.you.currentAge + 5, endAge: prev.you.currentAge + 15, untilDeath: false },
+      ],
+    }));
+  };
+  const updateIncome = (id, field, val) => {
+    setP((prev) => ({
+      ...prev,
+      income: prev.income.map((inc) => (inc.id === id ? { ...inc, [field]: val } : inc)),
+    }));
+  };
+  const removeIncome = (id) => {
+    setP((prev) => ({ ...prev, income: prev.income.filter((inc) => inc.id !== id) }));
+  };
+
+  // Per-person versions — used in single-person mode (always) and in partner mode whenever
+  // the Fixed income / Major expenses "Joint" toggle is off, so each person keeps their own list.
+  const addExpenseTo = (personKey) => {
+    setP((prev) => ({
+      ...prev,
+      [personKey]: {
+        ...prev[personKey],
+        expenses: [
+          ...prev[personKey].expenses,
+          { id: `e${Date.now()}`, label: "New expense", age: prev[personKey].currentAge + 5, amount: 10000 },
+        ],
+      },
+    }));
+  };
+  const updateExpenseIn = (personKey, id, field, val) => {
+    setP((prev) => ({
+      ...prev,
+      [personKey]: {
+        ...prev[personKey],
+        expenses: prev[personKey].expenses.map((e) => (e.id === id ? { ...e, [field]: val } : e)),
+      },
+    }));
+  };
+  const removeExpenseFrom = (personKey, id) => {
+    setP((prev) => ({
+      ...prev,
+      [personKey]: { ...prev[personKey], expenses: prev[personKey].expenses.filter((e) => e.id !== id) },
+    }));
+  };
+  const addIncomeTo = (personKey) => {
+    setP((prev) => ({
+      ...prev,
+      [personKey]: {
+        ...prev[personKey],
+        income: [
+          ...prev[personKey].income,
+          { id: `i${Date.now()}`, label: "New income", type: "oneTime", amount: 10000, age: prev[personKey].currentAge + 5, startAge: prev[personKey].currentAge + 5, endAge: prev[personKey].currentAge + 15, untilDeath: false },
+        ],
+      },
+    }));
+  };
+  const updateIncomeIn = (personKey, id, field, val) => {
+    setP((prev) => ({
+      ...prev,
+      [personKey]: {
+        ...prev[personKey],
+        income: prev[personKey].income.map((inc) => (inc.id === id ? { ...inc, [field]: val } : inc)),
+      },
+    }));
+  };
+  const removeIncomeFrom = (personKey, id) => {
+    setP((prev) => ({
+      ...prev,
+      [personKey]: { ...prev[personKey], income: prev[personKey].income.filter((inc) => inc.id !== id) },
+    }));
   };
 
   const onTrack = sim.depletionAge === null;
@@ -1211,15 +1625,14 @@ export default function RetirementRunway() {
 
   // Which of you has more calendar years left until your own life expectancy — i.e. who is
   // projected to be the longer-lived partner — plus the actual calendar year that lands on.
-  // This drives the simulation horizon (see numYears in simulateHousehold) and is what
-  // "Odds of success" is measured against, expressed as a year rather than an age on either
-  // person's own scale, since an age alone doesn't say whose age it is.
+  // Capped at the actual simulated horizon (sim.horizonAge), so this stays correct under the
+  // fixed 30-year time horizon option too, not just the life-expectancy-based one.
   const youYearsLeft = p.you.lifeExpectancy - p.you.currentAge;
   const partnerYearsLeft = p.partnerEnabled ? p.partner.lifeExpectancy - p.partner.currentAge : -Infinity;
   const longerLivedIsPartner = partnerYearsLeft > youYearsLeft;
-  const survivorYearsLeft = Math.max(youYearsLeft, partnerYearsLeft);
+  const survivorYearsLeft = sim.horizonAge - p.you.currentAge;
   const survivorCalendarYear = new Date().getFullYear() + survivorYearsLeft;
-  const survivorOwnAge = longerLivedIsPartner ? p.partner.lifeExpectancy : p.you.lifeExpectancy;
+  const survivorOwnAge = (longerLivedIsPartner ? p.partner.currentAge : p.you.currentAge) + survivorYearsLeft;
   const survivorSubject = longerLivedIsPartner ? partnerSubject : youSubject;
   const survivorIsThirdPerson = longerLivedIsPartner ? true : youNamed;
   const survivorPossessive = longerLivedIsPartner ? partnerPossessive : youPossessive;
@@ -1239,6 +1652,14 @@ export default function RetirementRunway() {
         .runway-slider::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%; background: #B98B3E; cursor: pointer; border: 2px solid #F0EAD8; }
         .runway-input:focus { outline: 1px solid #B98B3E; }
       `}</style>
+
+      <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 12, marginBottom: 6, fontFamily: "Inter, sans-serif", fontSize: 12, color: "#8A93A6" }}>
+        <span style={{ color: saveStatus === "error" ? "#E07A6B" : saveStatus === "saved" ? "#7FB88A" : "#8A93A6" }}>
+          {saveStatus === "saving" ? "Saving…" : saveStatus === "saved" ? "All changes saved" : saveStatus === "error" ? "Couldn't save — check connection" : ""}
+        </span>
+        <span>{user.email}</span>
+        <button onClick={onSignOut} style={{ background: "transparent", border: "1px solid #2A3355", color: "#F0EAD8", borderRadius: 6, padding: "4px 10px", cursor: "pointer", fontSize: 12, fontFamily: "Inter, sans-serif" }}>Sign out</button>
+      </div>
 
       <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 4 }}>
         <PlaneTakeoff size={22} color="#B98B3E" />
@@ -1260,23 +1681,52 @@ export default function RetirementRunway() {
           </div>
         )}
         <div style={{ width: 110 }}>
-          <NumberField label="Inflation" value={p.inflation} onChange={setField("inflation")} suffix="%/yr" info={INFO_INFLATION} compact />
+          <NumberField
+            label="Inflation"
+            value={p.monteCarloEnabled ? HIST_INFLATION_MEAN : p.inflation}
+            onChange={setField("inflation")}
+            suffix="%/yr"
+            info={p.monteCarloEnabled ? INFO_INFLATION_MC : INFO_INFLATION}
+            compact
+            disabled={p.monteCarloEnabled}
+            disabledNote={`${HIST_INFLATION_MEAN}% avg, σ${HIST_INFLATION_STDEV}`}
+          />
         </div>
         <div style={{ minWidth: 150 }}>
           <ToggleSwitch checked={p.partnerEnabled} onChange={setField("partnerEnabled")} label="Partner / spouse" compact />
+        </div>
+        <div style={{ width: 190 }}>
+          <div style={{ display: "flex", alignItems: "center", fontFamily: "Inter, sans-serif", fontSize: 12.5, color: "#8A93A6", marginBottom: 4 }}>
+            Time horizon
+            <InfoTip {...INFO_TIME_HORIZON} />
+          </div>
+          <select
+            value={p.timeHorizon}
+            onChange={(e) => setField("timeHorizon")(e.target.value)}
+            style={{ width: "100%", background: "#0E1426", border: "1px solid #2A3355", borderRadius: 6, color: "#F0EAD8", fontFamily: "Inter, sans-serif", fontSize: 12.5, padding: "6px 6px" }}
+          >
+            <option value="lifeExpectancy">{p.partnerEnabled ? "Until longer-lived partner" : "Until life expectancy"}</option>
+            <option value="fixed30">Fixed 30-year horizon</option>
+          </select>
         </div>
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: p.partnerEnabled ? "370px 1fr" : "270px 1fr", gap: 24, alignItems: "start" }}>
         <div>
-          <SectionLabel>Personal</SectionLabel>
-          {p.partnerEnabled ? (
+          <CollapsibleSectionLabel open={personalOpen} onToggle={() => setPersonalOpen((v) => !v)}>Personal</CollapsibleSectionLabel>
+          {personalOpen && (p.partnerEnabled ? (
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
               <div>
                 <PersonTag color={YOU_COLOR}>{youLabel}</PersonTag>
                 <MiniTextInput label="Name" value={p.you.name} onChange={setYou("name")} placeholder="You" />
                 <MiniNumberInput label="Current age" value={p.you.currentAge} onChange={setYou("currentAge")} />
-                <MiniNumberInput label="Retirement age" value={p.you.retirementAge} onChange={setYou("retirementAge")} />
+                <MiniNumberInput
+                  label="Retirement age"
+                  value={p.you.retirementAge}
+                  onChange={setYou("retirementAge")}
+                  disabled={p.you.semiRetirementEnabled}
+                  disabledNote="= semi-retirement end"
+                />
                 <MiniNumberInput label="Life expectancy" value={p.you.lifeExpectancy} onChange={setYou("lifeExpectancy")} />
                 <LifeExpectancyCalculator onApply={setYou("lifeExpectancy")} currentLifeExpectancy={p.you.lifeExpectancy} />
               </div>
@@ -1284,7 +1734,13 @@ export default function RetirementRunway() {
                 <PersonTag color={PARTNER_COLOR}>{partnerLabel}</PersonTag>
                 <MiniTextInput label="Name" value={p.partner.name} onChange={setPartner("name")} placeholder="Partner" />
                 <MiniNumberInput label="Current age" value={p.partner.currentAge} onChange={setPartner("currentAge")} />
-                <MiniNumberInput label="Retirement age" value={p.partner.retirementAge} onChange={setPartner("retirementAge")} />
+                <MiniNumberInput
+                  label="Retirement age"
+                  value={p.partner.retirementAge}
+                  onChange={setPartner("retirementAge")}
+                  disabled={p.partner.semiRetirementEnabled}
+                  disabledNote="= semi-retirement end"
+                />
                 <MiniNumberInput label="Life expectancy" value={p.partner.lifeExpectancy} onChange={setPartner("lifeExpectancy")} />
                 <LifeExpectancyCalculator onApply={setPartner("lifeExpectancy")} currentLifeExpectancy={p.partner.lifeExpectancy} />
               </div>
@@ -1293,11 +1749,19 @@ export default function RetirementRunway() {
             <>
               <TextField label="Name" value={p.you.name} onChange={setYou("name")} placeholder="Optional" />
               <NumberField label="Current age" value={p.you.currentAge} onChange={setYou("currentAge")} min={18} max={80} />
-              <NumberField label="Retirement age" value={p.you.retirementAge} onChange={setYou("retirementAge")} min={p.you.currentAge + 1} max={85} />
+              <NumberField
+                label="Retirement age"
+                value={p.you.retirementAge}
+                onChange={setYou("retirementAge")}
+                min={p.you.currentAge + 1}
+                max={85}
+                disabled={p.you.semiRetirementEnabled}
+                disabledNote="= semi-retirement end age"
+              />
               <NumberField label="Life expectancy" value={p.you.lifeExpectancy} onChange={setYou("lifeExpectancy")} min={p.you.retirementAge + 1} max={105} />
               <LifeExpectancyCalculator onApply={setYou("lifeExpectancy")} currentLifeExpectancy={p.you.lifeExpectancy} />
             </>
-          )}
+          ))}
 
           <SectionLabel>Semi-retirement</SectionLabel>
           {p.partnerEnabled ? (
@@ -1343,8 +1807,8 @@ export default function RetirementRunway() {
             </>
           )}
 
-          <SectionLabel>Savings & growth</SectionLabel>
-          {p.partnerEnabled ? (
+          <CollapsibleSectionLabel open={savingsOpen} onToggle={() => setSavingsOpen((v) => !v)}>Current savings and growth</CollapsibleSectionLabel>
+          {savingsOpen && (p.partnerEnabled ? (
             <>
               <JointToggleRow label="Current savings" joint={p.jointFlags.currentSavings} onToggle={setJointFlag("currentSavings")} />
               {p.jointFlags.currentSavings ? (
@@ -1429,7 +1893,7 @@ export default function RetirementRunway() {
               <NumberField label="Return after retirement" value={p.you.postReturn} onChange={setYou("postReturn")} min={0} max={10} step={0.25} suffix="%/yr" info={INFO_POST_RETURN} />
               <VolIndicator returnPct={p.you.postReturn} multiplier={p.volatilityMultiplier} />
             </>
-          )}
+          ))}
 
           <SectionLabel>Retirement income & spending</SectionLabel>
           {p.partnerEnabled ? (
@@ -1452,12 +1916,12 @@ export default function RetirementRunway() {
                 <div>
                   <PersonTag color={YOU_COLOR}>{youLabel}</PersonTag>
                   <MiniNumberInput label="Annual amount" value={p.you.socialSecurityAnnual} onChange={setYou("socialSecurityAnnual")} min={0} step={500} />
-                  <MiniNumberInput label="Start age" value={p.you.socialSecurityStartAge} onChange={setYou("socialSecurityStartAge")} />
+                  <MiniNumberInput label={`Starting age (${youLabel})`} value={p.you.socialSecurityStartAge} onChange={setYou("socialSecurityStartAge")} />
                 </div>
                 <div>
                   <PersonTag color={PARTNER_COLOR}>{partnerLabel}</PersonTag>
                   <MiniNumberInput label="Annual amount" value={p.partner.socialSecurityAnnual} onChange={setPartner("socialSecurityAnnual")} min={0} step={500} />
-                  <MiniNumberInput label="Start age" value={p.partner.socialSecurityStartAge} onChange={setPartner("socialSecurityStartAge")} />
+                  <MiniNumberInput label={`Starting age (${partnerLabel})`} value={p.partner.socialSecurityStartAge} onChange={setPartner("socialSecurityStartAge")} />
                 </div>
               </div>
             </>
@@ -1469,54 +1933,76 @@ export default function RetirementRunway() {
             </>
           )}
 
-          <SectionLabel>Major expenses</SectionLabel>
-          {p.expenses.map((e) => (
-            <div key={e.id} style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 8 }}>
-              <input
-                className="runway-input"
-                value={e.label}
-                onChange={(ev) => updateExpense(e.id, "label", ev.target.value)}
-                style={{ flex: 1, background: "#0E1426", border: "1px solid #2A3355", borderRadius: 6, color: "#F0EAD8", fontFamily: "Inter, sans-serif", fontSize: 12, padding: "6px 8px" }}
-              />
-              <input
-                className="runway-input"
-                type="number"
-                value={e.age}
-                onChange={(ev) => updateExpense(e.id, "age", Number(ev.target.value))}
-                title={`${youPossessive} age when it occurs`}
-                style={{ width: 48, background: "#0E1426", border: "1px solid #2A3355", borderRadius: 6, color: "#D9B872", fontFamily: "'IBM Plex Mono', monospace", fontSize: 12, padding: "6px 4px", textAlign: "center" }}
-              />
-              <input
-                className="runway-input"
-                type="number"
-                value={e.amount}
-                onChange={(ev) => updateExpense(e.id, "amount", Number(ev.target.value))}
-                title="Amount"
-                style={{ width: 78, background: "#0E1426", border: "1px solid #2A3355", borderRadius: 6, color: "#F0EAD8", fontFamily: "'IBM Plex Mono', monospace", fontSize: 12, padding: "6px 6px", textAlign: "right" }}
-              />
-              <button
-                onClick={() => removeExpense(e.id)}
-                aria-label="Remove expense"
-                style={{ background: "transparent", border: "none", color: "#C2542D", cursor: "pointer", padding: 4 }}
-              >
-                <Trash2 size={15} />
-              </button>
-            </div>
-          ))}
-          <button
-            onClick={addExpense}
-            style={{
-              display: "flex", alignItems: "center", gap: 6, background: "transparent",
-              border: "1px dashed #2A3355", borderRadius: 6, color: "#8A93A6",
-              fontFamily: "Inter, sans-serif", fontSize: 12.5, padding: "7px 10px", cursor: "pointer", marginTop: 4,
-            }}
-          >
-            <Plus size={14} /> Add expense
-          </button>
+          <SectionLabel>Fixed income</SectionLabel>
           {p.partnerEnabled && (
-            <p style={{ fontFamily: "Inter, sans-serif", fontSize: 10.5, color: "#5E6885", marginTop: 8, lineHeight: 1.5 }}>
-              Expense ages are keyed to {youPossessive.toLowerCase()} age (age {p.you.currentAge} + years from now), regardless of which partner it relates to.
-            </p>
+            <JointToggleRow label="Fixed income" joint={p.jointFlags.income} onToggle={setJointFlag("income")} />
+          )}
+          {p.partnerEnabled && !p.jointFlags.income ? (
+            <>
+              <PersonTag color={YOU_COLOR}>{youLabel}</PersonTag>
+              <IncomeList
+                items={p.you.income}
+                onAdd={() => addIncomeTo("you")}
+                onUpdate={(id, field, val) => updateIncomeIn("you", id, field, val)}
+                onRemove={(id) => removeIncomeFrom("you", id)}
+              />
+              <PersonTag color={PARTNER_COLOR}>{partnerLabel}</PersonTag>
+              <IncomeList
+                items={p.partner.income}
+                onAdd={() => addIncomeTo("partner")}
+                onUpdate={(id, field, val) => updateIncomeIn("partner", id, field, val)}
+                onRemove={(id) => removeIncomeFrom("partner", id)}
+              />
+              <p style={{ fontFamily: "Inter, sans-serif", fontSize: 10.5, color: "#5E6885", marginTop: -4, marginBottom: 10, lineHeight: 1.5 }}>
+                Each person's income ages are keyed to their own age. "Continue until death" runs through the end of the projection.
+              </p>
+            </>
+          ) : (
+            <>
+              <IncomeList items={p.income} onAdd={addIncome} onUpdate={updateIncome} onRemove={removeIncome} ageOwnerLabel={p.partnerEnabled ? youLabel : undefined} />
+              {p.partnerEnabled && (
+                <p style={{ fontFamily: "Inter, sans-serif", fontSize: 10.5, color: "#5E6885", marginTop: -4, marginBottom: 10, lineHeight: 1.5 }}>
+                  Income ages are keyed to {youPossessive.toLowerCase()} age (age {p.you.currentAge} + years from now), regardless of which partner it relates to. "Continue until death" runs through the end of the projection.
+                </p>
+              )}
+            </>
+          )}
+
+          <SectionLabel>Major expenses</SectionLabel>
+          {p.partnerEnabled && (
+            <JointToggleRow label="Major expenses" joint={p.jointFlags.expenses} onToggle={setJointFlag("expenses")} />
+          )}
+          {p.partnerEnabled && !p.jointFlags.expenses ? (
+            <>
+              <PersonTag color={YOU_COLOR}>{youLabel}</PersonTag>
+              <ExpenseList
+                items={p.you.expenses}
+                onAdd={() => addExpenseTo("you")}
+                onUpdate={(id, field, val) => updateExpenseIn("you", id, field, val)}
+                onRemove={(id) => removeExpenseFrom("you", id)}
+                ageTitle={`${youPossessive} age when it occurs`}
+              />
+              <PersonTag color={PARTNER_COLOR}>{partnerLabel}</PersonTag>
+              <ExpenseList
+                items={p.partner.expenses}
+                onAdd={() => addExpenseTo("partner")}
+                onUpdate={(id, field, val) => updateExpenseIn("partner", id, field, val)}
+                onRemove={(id) => removeExpenseFrom("partner", id)}
+                ageTitle={`${partnerPossessive} age when it occurs`}
+              />
+              <p style={{ fontFamily: "Inter, sans-serif", fontSize: 10.5, color: "#5E6885", marginTop: -4, lineHeight: 1.5 }}>
+                Each person's expense ages are keyed to their own age.
+              </p>
+            </>
+          ) : (
+            <>
+              <ExpenseList items={p.expenses} onAdd={addExpense} onUpdate={updateExpense} onRemove={removeExpense} ageTitle={`${youPossessive} age when it occurs`} ageLabel={p.partnerEnabled ? `Age (${youLabel})` : "Age"} />
+              {p.partnerEnabled && (
+                <p style={{ fontFamily: "Inter, sans-serif", fontSize: 10.5, color: "#5E6885", marginTop: -4, lineHeight: 1.5 }}>
+                  Expense ages are keyed to {youPossessive.toLowerCase()} age (age {p.you.currentAge} + years from now), regardless of which partner it relates to.
+                </p>
+              )}
+            </>
           )}
         </div>
         <div>
@@ -1548,7 +2034,7 @@ export default function RetirementRunway() {
               />
               <Tooltip
                 formatter={(v, name) => {
-                  const labels = { balance: "deterministic", high: "95th pct (Monte Carlo)", low: "5th pct (Monte Carlo)" };
+                  const labels = { balance: "deterministic", high: "95th pct (Monte Carlo)", low: "5th pct (Monte Carlo)", midHigh: "80th pct (Monte Carlo)", midLow: "20th pct (Monte Carlo)" };
                   return [fmtUSD(v), labels[name] || name];
                 }}
                 labelFormatter={(l) => `${youPossessive.toLowerCase()} age ${l}`}
@@ -1565,6 +2051,8 @@ export default function RetirementRunway() {
               )}
               {mc && <Area dataKey="low" stackId="band" stroke="none" fill="transparent" isAnimationActive={false} />}
               {mc && <Area dataKey="band" stackId="band" stroke="none" fill="#8A93A6" fillOpacity={0.18} isAnimationActive={false} />}
+              {mc && <Area dataKey="midLow" stackId="midband" stroke="none" fill="transparent" isAnimationActive={false} />}
+              {mc && <Area dataKey="midBand" stackId="midband" stroke="none" fill="#B98B3E" fillOpacity={0.22} isAnimationActive={false} />}
               <Area type="monotone" dataKey="balance" stroke="#B98B3E" strokeWidth={2} fill="url(#balFill)" />
             </AreaChart>
           </ResponsiveContainer>
@@ -1580,13 +2068,19 @@ export default function RetirementRunway() {
               5th–95th pct range ({mc.trials} Monte Carlo paths)
             </span>
           )}
+          {mc && (
+            <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
+              <span style={{ width: 10, height: 10, borderRadius: 2, background: "#B98B3E", opacity: 0.5, display: "inline-block" }} />
+              20th–80th pct range
+            </span>
+          )}
         </div>
         <p style={{ color: "#5E6885", fontSize: 11.5, marginTop: 10, fontFamily: "Inter, sans-serif" }}>
           {p.partnerEnabled && (
             <>The household holds one shared balance. "Retire" marks the age both of you have retired; if desired spending is joint, each of you unlocks half of it as you individually retire, rather than waiting for both retirements. The growth rate each year blends whichever phase — pre- or post-retirement — each of you is individually in. </>
           )}
           {mc ? (
-            <>The shaded band comes from {mc.trials} simulated paths. Each year's return is drawn from a normal distribution with a standard deviation derived from the historical risk/return relationship across stock/bond blends — roughly {mc.preVolPct}% pre-retirement and {mc.postVolPct}% post-retirement — scalable via the volatility multiplier above. The band shows the 5th–95th percentile balance at each age. "Odds of success" below is the share of paths that never ran out of money before {survivorCalendarYear}, the year {survivorSubject} reach{survivorIsThirdPerson ? "es" : ""} the life expectancy entered above.</>
+            <>The shaded bands come from {mc.trials} simulated paths. Each year's return is drawn from a normal distribution with a standard deviation derived from the historical risk/return relationship across stock/bond blends — roughly {mc.preVolPct}% pre-retirement and {mc.postVolPct}% post-retirement — scalable via the volatility multiplier above. Inflation is randomized too, drawn each year around a {HIST_INFLATION_MEAN}% historical average (σ {HIST_INFLATION_STDEV}%) with a slight negative correlation to that year's return. The wider, lighter band shows the 5th–95th percentile balance at each age; the narrower, gold band inside it shows the 20th–80th percentile — a tighter range of more likely outcomes. "Odds of success" below is the share of paths that never ran out of money before {survivorCalendarYear}, the year {survivorSubject} reach{survivorIsThirdPerson ? "es" : ""} the life expectancy entered above.</>
           ) : (
             <>Showing the deterministic forecast only — turn on Monte Carlo simulation above to see a simulated best/worst-case range and odds of success.</>
           )}
@@ -1605,6 +2099,7 @@ export default function RetirementRunway() {
             semiRetirementEndAge={p.you.semiRetirementEndAge}
             personLabel={youLabel}
             accentColor={YOU_COLOR}
+            sharedSpan={sim.horizonAge - p.you.currentAge}
           />
           <RunwayGauge
             currentAge={p.partner.currentAge}
@@ -1616,6 +2111,7 @@ export default function RetirementRunway() {
             semiRetirementEndAge={p.partner.semiRetirementEndAge}
             personLabel={partnerLabel}
             accentColor={PARTNER_COLOR}
+            sharedSpan={sim.horizonAge - p.you.currentAge}
           />
         </>
       ) : (
@@ -1630,7 +2126,7 @@ export default function RetirementRunway() {
         />
       )}
 
-      <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 22, fontFamily: "Inter, sans-serif", fontSize: 11, color: "#8A93A6" }}>
+      <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: p.partnerEnabled ? 6 : 22, fontFamily: "Inter, sans-serif", fontSize: 11, color: "#8A93A6" }}>
         <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
           <span style={{ width: 10, height: 10, borderRadius: 2, background: "linear-gradient(90deg, #6B8F71, #85A886)", display: "inline-block" }} />
           working / funded
@@ -1648,6 +2144,11 @@ export default function RetirementRunway() {
           shortfall
         </span>
       </div>
+      {p.partnerEnabled && (
+        <p style={{ fontFamily: "Inter, sans-serif", fontSize: 10.5, color: "#5E6885", marginBottom: 22, lineHeight: 1.5 }}>
+          Both bars share the same time scale — a given number of years from today lines up at the same horizontal position on both, so events like a retirement line up vertically between the two. Blank space at the end of a bar just means that person's own timeline ends before the other's.
+        </p>
+      )}
 
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", margin: "0 0 26px" }}>
         <StatCard
